@@ -11,14 +11,14 @@
 //               process
 //   --child     consenting child role: waits until terminated by the injector
 //
-// Every step prints explicit diagnostics with GetLastError on failure and all
-// child-side resources are freed and all handles closed on every path.
+// Every step prints explicit diagnostics. Cleanup failures make the run fail.
 
 #include <Windows.h>
 #include <Psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #pragma comment(lib, "ntdll.lib")
 
@@ -30,6 +30,21 @@
 static void PrintLastError(const char* step)
 {
 	fprintf(stderr, "[-] %s failed: E%lu\n", step, GetLastError());
+}
+
+static BOOL CloseOwnedHandle(HANDLE* handle, const char* name)
+{
+	if (*handle == NULL)
+	{
+		return TRUE;
+	}
+	if (!CloseHandle(*handle))
+	{
+		PrintLastError(name);
+		return FALSE;
+	}
+	*handle = NULL;
+	return TRUE;
 }
 
 // The consenting child role: stay alive quietly until the injector terminates
@@ -50,8 +65,9 @@ static int RunChild(void)
 // Resolve the payload DLL path next to this executable's build tree.
 static BOOL ResolvePayloadPath(WCHAR* buffer, DWORD capacity)
 {
-	WCHAR exePath[MAX_PATH] = { 0 };
-	if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0)
+	WCHAR exePath[MAX_PATH * 2] = { 0 };
+	DWORD length = GetModuleFileNameW(NULL, exePath, _countof(exePath));
+	if (length == 0 || length >= _countof(exePath))
 	{
 		PrintLastError("GetModuleFileNameW");
 		return FALSE;
@@ -63,6 +79,18 @@ static BOOL ResolvePayloadPath(WCHAR* buffer, DWORD capacity)
 		return FALSE;
 	}
 	*lastSlash = L'\0'; // exe directory: <root>\x64\<Configuration>
+	int written = _snwprintf_s(buffer, capacity, _TRUNCATE,
+		L"%ls\\InjectorPayload.dll", exePath);
+	if (written <= 0)
+	{
+		fprintf(stderr, "[-] Payload path does not fit the buffer\n");
+		return FALSE;
+	}
+	DWORD attributes = GetFileAttributesW(buffer);
+	if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+	{
+		return TRUE; // solution build: both outputs share the executable directory
+	}
 	WCHAR* configSlash = wcsrchr(exePath, L'\\');
 	if (configSlash == NULL)
 	{
@@ -83,16 +111,17 @@ static BOOL ResolvePayloadPath(WCHAR* buffer, DWORD capacity)
 #else
 	const WCHAR* configuration = L"Release";
 #endif
-	int written = _snwprintf_s(buffer, capacity, _TRUNCATE,
+	written = _snwprintf_s(buffer, capacity, _TRUNCATE,
 		L"%ls\\InjectorPayload\\x64\\%ls\\InjectorPayload.dll", exePath, configuration);
 	if (written <= 0 || (DWORD)written >= capacity)
 	{
 		fprintf(stderr, "[-] Payload path does not fit the buffer\n");
 		return FALSE;
 	}
-	if (GetFileAttributesW(buffer) == INVALID_FILE_ATTRIBUTES)
+	attributes = GetFileAttributesW(buffer);
+	if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))
 	{
-		fprintf(stderr, "[-] Payload DLL not found: %ls (build it first)\n", buffer);
+		fprintf(stderr, "[-] Payload DLL not found beside Injector.exe or at %ls (build both projects first)\n", buffer);
 		return FALSE;
 	}
 	return TRUE;
@@ -187,7 +216,7 @@ static BOOL WaitForMarkerFile(const WCHAR* markerPath, DWORD timeoutMs)
 	while (waited < timeoutMs)
 	{
 		DWORD attributes = GetFileAttributesW(markerPath);
-		if (attributes != INVALID_FILE_ATTRIBUTES)
+		if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
 		{
 			return TRUE;
 		}
@@ -248,46 +277,88 @@ static int RunInjection(void)
 	}
 	printf("[+] Payload DLL: %ls\n", payloadPath);
 
-	WCHAR exePath[MAX_PATH] = { 0 };
-	if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0)
+	WCHAR exePath[MAX_PATH * 2] = { 0 };
+	DWORD exeLength = GetModuleFileNameW(NULL, exePath, _countof(exePath));
+	if (exeLength == 0 || exeLength >= _countof(exePath))
 	{
 		PrintLastError("GetModuleFileNameW");
 		return EXIT_FAILURE;
 	}
 
 	WCHAR markerPath[MAX_PATH * 2] = { 0 };
-	DWORD tempLength = GetTempPathW(MAX_PATH, markerPath, _countof(markerPath));
-	if (tempLength == 0 || tempLength >= MAX_PATH)
+	DWORD tempLength = GetTempPathW(_countof(markerPath), markerPath);
+	if (tempLength == 0 || tempLength >= _countof(markerPath))
 	{
 		PrintLastError("GetTempPathW");
 		return EXIT_FAILURE;
 	}
-	_snwprintf_s(markerPath + tempLength, _countof(markerPath) - tempLength, _TRUNCATE,
-		L"injector-marker-%lu.txt", GetCurrentProcessId());
+	if (_snwprintf_s(markerPath + tempLength, _countof(markerPath) - tempLength, _TRUNCATE,
+		L"injector-marker-%lu.txt", GetCurrentProcessId()) <= 0)
+	{
+		fprintf(stderr, "[-] Marker path does not fit the buffer\n");
+		return EXIT_FAILURE;
+	}
+
+	int result = EXIT_FAILURE;
+	BOOL cleanupOk = TRUE;
+	BOOL childStopped = FALSE;
+	BOOL markerEnvironmentChanged = FALSE;
+	BOOL previousMarkerExists = FALSE;
+	WCHAR* previousMarker = NULL;
+	HANDLE remoteThread = NULL;
+	LPVOID remoteBuffer = NULL;
+	PROCESS_INFORMATION child = { 0 };
+
+	SetLastError(ERROR_SUCCESS);
+	DWORD previousLength = GetEnvironmentVariableW(L"INJECTOR_MARKER", NULL, 0);
+	if (previousLength == 0 && GetLastError() != ERROR_ENVVAR_NOT_FOUND && GetLastError() != ERROR_SUCCESS)
+	{
+		PrintLastError("GetEnvironmentVariableW(INJECTOR_MARKER size)");
+		goto cleanup;
+	}
+	previousMarkerExists = previousLength != 0 || GetLastError() == ERROR_SUCCESS;
+	if (previousMarkerExists)
+	{
+		DWORD capacity = previousLength ? previousLength : 1;
+		previousMarker = calloc(capacity, sizeof(WCHAR));
+		if (previousMarker == NULL)
+		{
+			fprintf(stderr, "[-] Cannot save the previous INJECTOR_MARKER value\n");
+			goto cleanup;
+		}
+		if (previousLength != 0)
+		{
+			DWORD copied = GetEnvironmentVariableW(L"INJECTOR_MARKER", previousMarker, capacity);
+			if (copied == 0 || copied >= capacity)
+			{
+				PrintLastError("GetEnvironmentVariableW(INJECTOR_MARKER value)");
+				goto cleanup;
+			}
+		}
+	}
 	if (!SetEnvironmentVariableW(L"INJECTOR_MARKER", markerPath))
 	{
 		PrintLastError("SetEnvironmentVariableW(INJECTOR_MARKER)");
-		return EXIT_FAILURE;
+		goto cleanup;
 	}
+	markerEnvironmentChanged = TRUE;
 	printf("[+] Marker path (inherited by the child): %ls\n", markerPath);
 
 	// Step 1: spawn the consenting child suspended.
-	WCHAR commandLine[MAX_PATH + 16] = { 0 };
-	_snwprintf_s(commandLine, _countof(commandLine), _TRUNCATE, L"\"%ls\" --child", exePath);
+	WCHAR commandLine[MAX_PATH * 2 + 16] = { 0 };
+	if (_snwprintf_s(commandLine, _countof(commandLine), _TRUNCATE, L"\"%ls\" --child", exePath) <= 0)
+	{
+		fprintf(stderr, "[-] Child command line does not fit the buffer\n");
+		goto cleanup;
+	}
 	STARTUPINFOW startup = { sizeof(startup) };
-	PROCESS_INFORMATION child = { 0 };
 	if (!CreateProcessW(exePath, commandLine, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &startup, &child))
 	{
 		PrintLastError("CreateProcessW(child, SUSPENDED)");
-		return EXIT_FAILURE;
+		goto cleanup;
 	}
 	printf("[+] Step 1 SPAWN: consenting child started suspended, PID %lu, main thread %lu\n",
 		child.dwProcessId, child.dwThreadId);
-
-	int result = EXIT_FAILURE;
-	HANDLE remoteThread = NULL;
-	LPVOID remoteBuffer = NULL;
-	BOOL injected = FALSE;
 
 	// A suspended child has not run its loader yet: kernel32 is not mapped and
 	// module enumeration fails with E299 (partial copy). Resume first, then
@@ -301,30 +372,14 @@ static int RunInjection(void)
 	printf("[+] Step 1 SPAWN: child resumed (previous suspend count %lu); waiting for its loader\n",
 		(unsigned long)previousCount);
 
-	HANDLE inspectable = NULL;
 	BOOL baseVerified = FALSE;
 	for (DWORD attempt = 0; attempt < 50 && !baseVerified; attempt++)
 	{
-		if (inspectable != NULL)
-		{
-			CloseHandle(inspectable);
-			inspectable = NULL;
-		}
-		inspectable = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, child.dwProcessId);
-		if (inspectable == NULL)
-		{
-			Sleep(100);
-			continue;
-		}
-		baseVerified = VerifyRemoteKernel32Base(inspectable, kernel32, attempt == 49);
+		baseVerified = VerifyRemoteKernel32Base(child.hProcess, kernel32, attempt == 49);
 		if (!baseVerified)
 		{
 			Sleep(100);
 		}
-	}
-	if (inspectable != NULL)
-	{
-		CloseHandle(inspectable);
 	}
 	if (!baseVerified)
 	{
@@ -393,38 +448,42 @@ static int RunInjection(void)
 		fprintf(stderr, "[-] LoadLibraryW returned NULL inside the child; the payload did not load\n");
 		goto cleanup;
 	}
-	injected = TRUE;
-
 	// Step 5: collect both execution proofs (the child is already running).
 	printf("[+] Step 5 PROOF: waiting for the payload's marker file\n");
 
 	BOOL markerSeen = WaitForMarkerFile(markerPath, MARKER_WAIT_MS);
 	if (markerSeen)
 	{
+		markerSeen = FALSE;
 		FILE* marker = _wfopen(markerPath, L"r");
 		if (marker != NULL)
 		{
 			char line[256] = { 0 };
+			char expected[256] = { 0 };
+			_snprintf_s(expected, sizeof(expected), _TRUNCATE,
+				"InjectorPayload DllMain executed in PID %lu\n", child.dwProcessId);
 			if (fgets(line, sizeof(line), marker) != NULL)
 			{
-				printf("[+] Marker proof: %s", line);
+				markerSeen = strcmp(line, expected) == 0;
+				if (markerSeen)
+				{
+					printf("[+] Marker proof: %s", line);
+				}
 			}
-			fclose(marker);
+			if (fclose(marker) != 0)
+			{
+				fprintf(stderr, "[-] Closing the marker proof file failed\n");
+				cleanupOk = FALSE;
+			}
 		}
 	}
-	else
+	if (!markerSeen)
 	{
-		fprintf(stderr, "[-] Marker file did not appear within %lu ms\n", MARKER_WAIT_MS);
+		fprintf(stderr, "[-] Valid marker proof did not appear within %lu ms\n", MARKER_WAIT_MS);
 	}
 
 	HMODULE payloadModule = NULL;
-	HANDLE listable = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, child.dwProcessId);
-	BOOL moduleSeen = FALSE;
-	if (listable != NULL)
-	{
-		moduleSeen = FindChildModule(listable, L"InjectorPayload.dll", &payloadModule);
-		CloseHandle(listable);
-	}
+	BOOL moduleSeen = FindChildModule(child.hProcess, L"InjectorPayload.dll", &payloadModule);
 	if (moduleSeen)
 	{
 		printf("[+] Module proof: InjectorPayload.dll present in the child at %p\n", (LPCVOID)payloadModule);
@@ -438,66 +497,144 @@ static int RunInjection(void)
 	printf("[+] Injection %s\n", result == EXIT_SUCCESS ? "demonstrated: both proofs collected" : "NOT proven: missing proof(s)");
 
 cleanup:
-	// Step 6: account for every child-side change and every handle.
-	if (remoteBuffer != NULL && child.hProcess != NULL)
+	// The path belongs to a possibly active LoadLibraryW thread. Never free it
+	// until that thread has exited, or the child has stopped and released it.
+	if (remoteBuffer != NULL &&
+		(remoteThread == NULL || WaitForSingleObject(remoteThread, 0) == WAIT_OBJECT_0))
 	{
 		if (VirtualFreeEx(child.hProcess, remoteBuffer, 0, MEM_RELEASE))
 		{
+			remoteBuffer = NULL;
 			printf("[+] Step 6 CLEANUP: remote buffer freed\n");
 		}
 		else
 		{
 			PrintLastError("VirtualFreeEx(remote buffer)");
+			cleanupOk = FALSE;
 		}
-	}
-	if (remoteThread != NULL)
-	{
-		CloseHandle(remoteThread);
-		printf("[+] Step 6 CLEANUP: remote thread handle closed\n");
 	}
 	if (child.hProcess != NULL)
 	{
-		if (injected || result == EXIT_FAILURE)
+		DWORD childWait = WaitForSingleObject(child.hProcess, 0);
+		if (childWait == WAIT_OBJECT_0)
 		{
+			childStopped = TRUE;
+			printf("[+] Step 6 CLEANUP: child already exited\n");
+		}
+		else
+		{
+			if (childWait == WAIT_FAILED)
+			{
+				PrintLastError("WaitForSingleObject(child state)");
+				cleanupOk = FALSE;
+			}
 			if (TerminateProcess(child.hProcess, 0))
 			{
-				WaitForSingleObject(child.hProcess, CHILD_EXIT_WAIT_MS);
-				printf("[+] Step 6 CLEANUP: child terminated by the injector\n");
+				childWait = WaitForSingleObject(child.hProcess, CHILD_EXIT_WAIT_MS);
+				if (childWait == WAIT_OBJECT_0)
+				{
+					childStopped = TRUE;
+					printf("[+] Step 6 CLEANUP: child terminated by the injector\n");
+				}
+				else
+				{
+					if (childWait == WAIT_FAILED)
+					{
+						PrintLastError("WaitForSingleObject(child exit)");
+					}
+					else
+					{
+						fprintf(stderr, "[-] Child exit not confirmed within %lu ms\n", CHILD_EXIT_WAIT_MS);
+					}
+					cleanupOk = FALSE;
+				}
 			}
 			else
 			{
 				PrintLastError("TerminateProcess(child)");
+				cleanupOk = FALSE;
 			}
 		}
-		CloseHandle(child.hProcess);
 	}
-	if (child.hThread != NULL)
+	if (remoteBuffer != NULL)
 	{
-		CloseHandle(child.hThread);
+		if (childStopped)
+		{
+			printf("[+] Step 6 CLEANUP: remote buffer released with the child's address space\n");
+		}
+		else
+		{
+			fprintf(stderr, "[-] Remote buffer retained because child/thread exit was not confirmed\n");
+			cleanupOk = FALSE;
+		}
 	}
-	DeleteFileW(markerPath);
-	SetEnvironmentVariableW(L"INJECTOR_MARKER", NULL);
-	printf("[+] Step 6 CLEANUP: marker deleted, environment restored, handles closed\n");
+	if (remoteThread != NULL)
+	{
+		if (CloseOwnedHandle(&remoteThread, "CloseHandle(remote thread)"))
+		{
+			printf("[+] Step 6 CLEANUP: remote thread handle closed\n");
+		}
+		else
+		{
+			cleanupOk = FALSE;
+		}
+	}
+	if (!CloseOwnedHandle(&child.hThread, "CloseHandle(child thread)"))
+	{
+		cleanupOk = FALSE;
+	}
+	if (!CloseOwnedHandle(&child.hProcess, "CloseHandle(child process)"))
+	{
+		cleanupOk = FALSE;
+	}
+	if (markerEnvironmentChanged)
+	{
+		if (!DeleteFileW(markerPath))
+		{
+			DWORD error = GetLastError();
+			if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+			{
+				SetLastError(error);
+				PrintLastError("DeleteFileW(marker)");
+				cleanupOk = FALSE;
+			}
+		}
+		if (!SetEnvironmentVariableW(L"INJECTOR_MARKER", previousMarkerExists ? previousMarker : NULL))
+		{
+			PrintLastError("SetEnvironmentVariableW(restore INJECTOR_MARKER)");
+			cleanupOk = FALSE;
+		}
+	}
+	free(previousMarker);
+	if (cleanupOk)
+	{
+		printf("[+] Step 6 CLEANUP: marker absent, environment restored, handles closed\n");
+	}
+	else
+	{
+		fprintf(stderr, "[-] Step 6 CLEANUP: incomplete; run failed\n");
+		result = EXIT_FAILURE;
+	}
 	return result;
 }
 
-int main(int argc, char* argv[])
+int wmain(int argc, wchar_t* argv[])
 {
 	if (argc == 1)
 	{
 		return RunInjection();
 	}
-	if (argc == 2 && strcmp(argv[1], "--plan") == 0)
+	if (argc == 2 && wcscmp(argv[1], L"--plan") == 0)
 	{
 		return RunPlan();
 	}
-	if (argc == 2 && strcmp(argv[1], "--child") == 0)
+	if (argc == 2 && wcscmp(argv[1], L"--child") == 0)
 	{
 		return RunChild();
 	}
-	fprintf(stderr, "Usage: %s              full injection run (self-spawned consenting child only)\n", argv[0]);
-	fprintf(stderr, "       %s --plan       read-only resolution; opens no process\n", argv[0]);
-	fprintf(stderr, "       %s --child      consenting child role (used internally)\n", argv[0]);
+	fprintf(stderr, "Usage: %ls              full injection run (self-spawned consenting child only)\n", argv[0]);
+	fprintf(stderr, "       %ls --plan       read-only resolution; opens no process\n", argv[0]);
+	fprintf(stderr, "       %ls --child      consenting child role (used internally)\n", argv[0]);
 	fprintf(stderr, "This tool refuses arbitrary PID targets by design; it only injects into its own child.\n");
 	return 2;
 }
